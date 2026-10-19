@@ -1,442 +1,764 @@
-"""AI Hub: Telegram bot + Mini App (liquid glass) + AI'lar boshqaruvi, hammasi bitta faylda.
-
-O'RNATISH
-  pip install fastapi uvicorn httpx python-dotenv
-ISHGA TUSHIRISH
-  uvicorn ai_hub:app --host 0.0.0.0 --port 8000      (HTTPS domen kerak: Caddy / Cloudflare Tunnel)
-.env FAYLI (shu fayl yonida)
-  BOT_TOKEN=...            # @BotFather'dan
-  ADMIN_IDS=111,222        # botga /id yozib o'z ID'ingizni bilib oling
-  WEBAPP_URL=https://domeningiz.uz
-  # har biriga vergul bilan bir nechta kalit: k1,k2,k3 (limit tugasa keyingisiga o'tadi)
-  GEMINI_API_KEYS=  OPENROUTER_API_KEYS=  GROQ_API_KEYS=  CLOUDFLARE_API_KEYS=  CF_ACCOUNT_ID=
-  ZAI_API_KEYS=  SAMBANOVA_API_KEYS=  MISTRAL_API_KEYS=
-  # ixtiyoriy (pullik): ANTHROPIC_API_KEYS=  OPENAI_API_KEYS=  CEREBRAS_API_KEYS=
-  # modelni almashtirish: GEMINI_MODEL, GROQ_MODEL, ZAI_MODEL, SAMBANOVA_MODEL, CLOUDFLARE_MODEL ...
-BOT: /start -> Mini App tugmasi, /id -> Telegram ID'ingiz.
 """
-import os, hmac, hashlib, json, asyncio, io, re, time, sqlite3, zipfile, base64, random
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+Claude Bot - Telegram Mini App (FastAPI + Anthropic API), Claude-style dizayn.
+
+O'rnatish:
+    pip install fastapi uvicorn httpx anthropic
+
+Muhit o'zgaruvchilari (env):
+    BOT_TOKEN          - @BotFather'dan olingan token
+    ANTHROPIC_API_KEY  - console.anthropic.com dagi API kalit
+    ADMIN_ID           - sizning Telegram ID'ingiz (raqam)
+    WEBAPP_URL         - HTTPS manzil, masalan https://sizning-domen.uz
+    BUDGET_USD         - ixtiyoriy, standart 100 (limitga yetganda bot to'xtaydi)
+    PORT               - ixtiyoriy, standart 8000
+    ANTHROPIC_BASE_URL - ixtiyoriy, proksi manzili (masalan https://api.mwapi.dev)
+    MODEL_IDS          - ixtiyoriy, model nomlari vergul bilan (proksi qo'llab-quvvatlaydigan nomlar).
+                         Admin /models buyrug'i proksidagi mavjud nomlarni ko'rsatadi
+    DB_PATH            - baza fayli yo'li. Serverda DOIMIY diskka ko'rsating,
+                         masalan /var/data/claude_bot.db (aks holda har deploy'da tarix o'chadi)
+
+Ishga tushirish:
+    python claude_bot.py
+
+Admin buyruqlari (botda): /allow <id>, /deny <id>, /users, /backup, /models
+"""
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl
+
 import httpx
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import uvicorn
+from anthropic import AsyncAnthropic
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
 
-load_dotenv()
-E = os.getenv
-BOT_TOKEN, WEBAPP_URL = E("BOT_TOKEN", ""), E("WEBAPP_URL", "")
-ADMINS = {int(x) for x in E("ADMIN_IDS", "").split(",") if x.strip()}
-T = 50
-SYS = ("Sen tajribali dasturchisan. Vazifa bo'yicha tayyor, ishlaydigan kod yoz. Har bir faylni alohida "
-       "```til bloki ichida ber va blokning birinchi qatori albatta `# fayl: yo'l/nom.ext` bo'lsin. Qisqa tushuntirish qo'sh.")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # loglarda bot tokeni ko'rinib qolmasin
+log = logging.getLogger("claude_bot")
 
-db = sqlite3.connect("data.db", check_same_thread=False)
-db.execute("create table if not exists users(id integer primary key, name text)")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+BUDGET = float(os.environ.get("BUDGET_USD", "100"))
+PORT = int(os.environ.get("PORT", "8000"))
+DB_PATH = os.environ.get("DB_PATH", "claude_bot.db")
 
-class QuotaError(Exception):
-    def __init__(self, until, text=""): self.until, self.text = until, text
+SYSTEM = os.environ.get(
+    "SYSTEM_PROMPT",
+    "Siz Claude'siz. Foydalanuvchi qaysi tilda yozsa, shu tilda aniq va qisqa javob bering. "
+    "Kodni doim ```til bloklarida bering. Rasm so'ralsa, to'liq ishlaydigan SVG kodni ```svg blokida bering "
+    "(xmlns va viewBox bilan, tashqi havolalarsiz) va qisqa izoh yozing.",
+)
 
-class ApiError(Exception):
-    def __init__(self, status, text):
-        self.status, self.text = status, text
-        super().__init__(f"{status}: {text[:300]}")
-
-def next_reset(prov):
-    tz = ZoneInfo("America/Los_Angeles") if prov == "Gemini" else timezone.utc
-    n = datetime.now(tz)
-    return (n + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-
-def check(r, prov):
-    if r.status_code in (429, 402):
-        t = r.text.lower().replace(" ", "")
-        ra = r.headers.get("retry-after")
-        m = re.search(r'retrydelay"?:"?(\d+)', t)
-        if ra and ra.isdigit(): until = time.time() + int(ra)
-        elif "perday" in t or "daily" in t: until = next_reset(prov)
-        elif m: until = time.time() + int(m.group(1))
-        else: until = time.time() + 60
-        raise QuotaError(until, r.text)
-    if r.status_code >= 400:
-        raise ApiError(r.status_code, r.text)
-
-class Pool:
-    def __init__(s, name, env, fn):
-        s.name, s.fn, s.cool, s.bad_keys, s.last_text = name, fn, {}, set(), ""
-        s.keys = [k.strip() for k in E(env, "").split(",") if k.strip()]
-    bad = None
-    def ready(s): return [k for k in s.keys if k not in s.bad_keys and s.cool.get(k, 0) <= time.time()]
-    def reset_in(s):
-        c = [s.cool.get(k, 0) for k in s.keys if k not in s.bad_keys]
-        return max(0, int(min(c) - time.time())) if c else 0
-    async def call(s, task, system=SYS):
-        last = None
-        for k in s.ready():
-            try: return await s.fn(k, task, system, s.name)
-            except QuotaError as q: s.cool[k], s.last_text = q.until, q.text
-            except ApiError as e:
-                if e.status not in (401, 403): raise
-                s.bad_keys.add(k); last = e
-        if last: raise last
-        live = [s.cool[k] for k in s.keys if k in s.cool and k not in s.bad_keys]
-        if not live: raise RuntimeError("Barcha kalitlar yaroqsiz (401/403). Kalitlarni tekshiring.")
-        raise QuotaError(min(live), s.last_text)
-
-BASES = {"Groq": "https://api.groq.com/openai/v1", "Mistral": "https://api.mistral.ai/v1",
-         "Z.ai": "https://api.z.ai/api/paas/v4", "SambaNova": "https://api.sambanova.ai/v1",
-         "OpenRouter": "https://openrouter.ai/api/v1", "Cerebras": "https://api.cerebras.ai/v1"}
-PREFS = {"Gemini": ["flash-latest", "flash"], "Groq": ["llama-3.3-70b", "llama-3.1-8b", "gpt-oss", "llama"],
-         "Mistral": ["mistral-small", "mistral-medium", "open-mistral", "mistral"], "Z.ai": ["glm-4.5-flash", "flash", "glm"],
-         "SambaNova": ["Llama-3.3-70B", "Llama", "gpt-oss", "DeepSeek"], "OpenRouter": ["llama-3.3-70b", "deepseek", "gemma", "qwen"],
-         "Cerebras": ["gpt-oss", "llama"]}
-BADW = ("whisper", "guard", "tts", "embed", "moderation", "ocr", "audio", "image", "live", "transcribe", "safeguard", "orpheus", "prompt")
-MODELS = {}
-
-async def discover_all(name, key):
-    """Provayderning hozirgi modellar ro'yxatidan mos modelni topadi (eski model o'chirilgan bo'lsa)."""
-    async with httpx.AsyncClient(timeout=30) as c:
-        if name == "Gemini":
-            r = await c.get("https://generativelanguage.googleapis.com/v1beta/models", headers={"x-goog-api-key": key}, params={"pageSize": 200})
-            if r.status_code >= 400: raise ApiError(r.status_code, r.text)
-            ids = [m["name"].split("/", 1)[1] for m in r.json().get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
-        else:
-            r = await c.get(BASES[name] + "/models", headers={"Authorization": f"Bearer {key}"})
-            if r.status_code >= 400: raise ApiError(r.status_code, r.text)
-            ids = [m["id"] for m in r.json().get("data", [])]
-    ids = [i for i in ids if not any(w in i.lower() for w in BADW)]
-    if name == "OpenRouter": ids = [i for i in ids if i.endswith(":free")]
-    out = []
-    for p in PREFS[name]:
-        out += [i for i in sorted(ids, reverse=True) if p.lower() in i.lower() and i not in out]
-    out += [i for i in ids if i not in out]
-    if not out: raise RuntimeError("Mos model topilmadi")
-    return out
-
-async def discover(name, key):
-    return (await discover_all(name, key))[0]
-
-def oai(url, env, default):
-    async def f(key, task, system, name):
-        async def go(model):
-            async with httpx.AsyncClient(timeout=T) as c:
-                r = await c.post(url, headers={"Authorization": f"Bearer {key}"}, json={"model": model,
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": task}]})
-                check(r, name)
-                return r.json()["choices"][0]["message"]["content"]
-        try: return await go(E(env) or MODELS.get(name) or default)
-        except ApiError as e:
-            if e.status in (400, 404) and not E(env) and name in BASES:
-                try: MODELS[name] = await discover(name, key)
-                except Exception: raise e
-                return await go(MODELS[name])
-            raise
-        except QuotaError as q:
-            if E(env) or name not in BASES or q.until - time.time() > 300: raise
-            try: cands = await discover_all(name, key)
-            except Exception: raise q
-            cur = MODELS.get(name) or default
-            for m in [c for c in cands if c != cur][:3]:
-                try:
-                    out = await go(m); MODELS[name] = m
-                    return out
-                except (QuotaError, ApiError): continue
-            raise q
-    return f
-
-async def gemini(key, task, system, name):
-    async def go(model):
-        async with httpx.AsyncClient(timeout=T) as c:
-            r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": key}, json={"systemInstruction": {"parts": [{"text": system}]},
-                                                        "contents": [{"parts": [{"text": task}]}]})
-            check(r, name)
-            return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
-    try: return await go(E("GEMINI_MODEL") or MODELS.get(name) or "gemini-flash-latest")
-    except ApiError as e:
-        if e.status in (400, 404) and not E("GEMINI_MODEL"):
-            try: MODELS[name] = await discover(name, key)
-            except Exception: raise e
-            return await go(MODELS[name])
-        raise
-
-async def claude(key, task, system, name):
-    async with httpx.AsyncClient(timeout=T) as c:
-        r = await c.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-            json={"model": E("CLAUDE_MODEL", "claude-sonnet-4-5"), "max_tokens": 4000, "system": system,
-                  "messages": [{"role": "user", "content": task}]})
-        check(r, name)
-        return "".join(b.get("text", "") for b in r.json()["content"])
-
-async def cloudflare(key, task, system, name):
-    ks = [k.strip() for k in E("CLOUDFLARE_API_KEYS", "").split(",") if k.strip()]
-    ids = [i.strip() for i in E("CF_ACCOUNT_IDS", "").split(",") if i.strip()]
-    acc = ids[ks.index(key)] if key in ks and ks.index(key) < len(ids) else ""
-    url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/v1/chat/completions"
-    return await oai(url, "CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")(key, task, system, name)
-
-pools = [Pool(n, e, f) for n, e, f in [
-    ("Gemini", "GEMINI_API_KEYS", gemini), ("Claude", "ANTHROPIC_API_KEYS", claude),
-    ("Codex", "OPENAI_API_KEYS", oai("https://api.openai.com/v1/chat/completions", "OPENAI_MODEL", "gpt-4.1")),
-    ("Groq", "GROQ_API_KEYS", oai("https://api.groq.com/openai/v1/chat/completions", "GROQ_MODEL", "llama-3.3-70b-versatile")),
-    ("OpenRouter", "OPENROUTER_API_KEYS", oai("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")),
-    ("Mistral", "MISTRAL_API_KEYS", oai("https://api.mistral.ai/v1/chat/completions", "MISTRAL_MODEL", "mistral-small-latest")),
-    ("Z.ai", "ZAI_API_KEYS", oai("https://api.z.ai/api/paas/v4/chat/completions", "ZAI_MODEL", "glm-4.5-flash")),
-    ("SambaNova", "SAMBANOVA_API_KEYS", oai("https://api.sambanova.ai/v1/chat/completions", "SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct")),
-    ("Cloudflare", "CLOUDFLARE_API_KEYS", cloudflare),
-    ("Cerebras", "CEREBRAS_API_KEYS", oai("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_MODEL", "gpt-oss-120b")),
-]]
-pools = [p for p in pools if p.keys and (p.name != "Cloudflare" or E("CF_ACCOUNT_IDS"))]
-
-def human(sec):
-    h, m = divmod(sec // 60, 60)
-    return f"{h} soat {m} daqiqa" if h else f"{m} daqiqa {sec % 60} soniya" if m else f"{sec} soniya"
-
-def auth(init):
-    if not BOT_TOKEN: return 0, "dev", True
-    d = dict(parse_qsl(init, keep_blank_values=True)); h = d.pop("hash", "")
-    s = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
-    key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    if not h or not hmac.compare_digest(hmac.new(key, s.encode(), hashlib.sha256).hexdigest(), h):
-        raise HTTPException(401, "Telegram imzosi noto'g'ri")
-    u = json.loads(d["user"]); uid = u["id"]
-    adm = uid in ADMINS
-    if not adm and not db.execute("select 1 from users where id=?", (uid,)).fetchone():
-        raise HTTPException(403, "Sizga ruxsat berilmagan. Admin bilan bog'laning.")
-    return uid, u.get("first_name", ""), adm
-
-app = FastAPI()
-
-@app.on_event("startup")
-async def menu():
-    if BOT_TOKEN and WEBAPP_URL:
-        async with httpx.AsyncClient() as c:
-            await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton", json={
-                "menu_button": {"type": "web_app", "text": "AI Hub", "web_app": {"url": WEBAPP_URL}}})
+MODELS = {
+    "claude-haiku-5-5": {"name": "Haiku 5.5", "desc": "Eng tez va arzon"},
+    "claude-sonnet-5-5": {"name": "Sonnet 5.5", "desc": "Kundalik ishlar uchun muvozanatli"},
+    "claude-opus-5-5": {"name": "Opus 5.5", "desc": "Eng kuchli, qiyin vazifalar uchun"},
+}
+_ids = [x.strip() for x in os.environ.get("MODEL_IDS", "").split(",") if x.strip()]
+if _ids:
+    MODELS = {i: {"name": i, "desc": ""} for i in _ids}
+DEFAULT_MODEL = "claude-haiku-5-5" if "claude-haiku-5-5" in MODELS else next(iter(MODELS))
 
 
-async def bot_loop():
-    if not (BOT_TOKEN and WEBAPP_URL): return
-    api, off = f"https://api.telegram.org/bot{BOT_TOKEN}", 0
-    async with httpx.AsyncClient(timeout=40) as c:
-        while True:
-            try:
-                for u in (await c.get(api + "/getUpdates", params={"offset": off, "timeout": 25})).json().get("result", []):
-                    off = u["update_id"] + 1
-                    m = u.get("message") or {}
-                    txt, cid = m.get("text", ""), m.get("chat", {}).get("id")
-                    if txt.startswith("/start"):
-                        await c.post(api + "/sendMessage", json={"chat_id": cid,
-                            "text": "AI Hub: vazifani yozing, bir nechta AI bir vaqtda javob beradi.",
-                            "reply_markup": {"inline_keyboard": [[{"text": "AI Hub’ni ochish", "web_app": {"url": WEBAPP_URL}}]]}})
-                    elif txt.startswith("/id"):
-                        await c.post(api + "/sendMessage", json={"chat_id": cid, "text": f"Sizning ID: {m['from']['id']}"})
-            except Exception:
-                await asyncio.sleep(3)
-
-@app.on_event("startup")
-async def start_bot():
-    asyncio.create_task(bot_loop())
-
-class Req(BaseModel):
-    initData: str = ""
-    task: str = ""
-    text: str = ""
-    answers: dict = {}
-    action: str = ""
-    stream: bool = False
-    id: int = 0
-    name: str = ""
-
-@app.get("/")
-def index(): return HTMLResponse(HTML, headers={"Cache-Control": "no-store"})
-
-@app.post("/api/me")
-def me(r: Req):
-    _, _, adm = auth(r.initData)
-    return {"admin": adm, "providers": [p.name for p in pools]}
-
-async def ask(p, task):
-    try: return {"ok": True, "text": await p.call(task)}
-    except QuotaError as q:
-        w = max(0, int(q.until - time.time()))
-        why = ("\nProvayder javobi: " + q.text.strip()[:200]) if q.text.strip() else ""
-        head = (f"Kreditlar tugadi. Tiklanishiga taxminan {human(w)} qoldi." if w > 1800
-                else f"So'rovlar limiti vaqtincha to'ldi. Taxminan {human(w)} dan keyin qayta urinib ko'ring.")
-        return {"ok": False, "text": head + why}
-    except Exception as e: return {"ok": False, "text": f"Xatolik: {type(e).__name__}: {e}"}
-
-ALIASES = {"gemini": "Gemini", "antigravity": "Gemini", "claude": "Claude", "codex": "Codex", "openai": "Codex",
-           "gpt": "Codex", "groq": "Groq", "openrouter": "OpenRouter", "mistral": "Mistral", "cerebras": "Cerebras",
-           "zai": "Z.ai", "z.ai": "Z.ai", "glm": "Z.ai", "sambanova": "SambaNova", "cloudflare": "Cloudflare", "grok": "Grok"}
-NAME_RE = re.compile(r"(?<![\w.])(" + "|".join(sorted(map(re.escape, ALIASES), key=len, reverse=True)) + r")(?![\w.])\s*[:\-]?\s*", re.I)
-
-def split_tasks(text):
-    """None -> hamma AI'ga bir xil vazifa; dict -> {AI: vazifa}"""
-    t = text.strip()
-    m0 = re.match(r"hamma\s*[:\-]\s*", t, re.I)
-    if m0: return None, t[m0.end():]
-    ms = NAME_RE.findall(t) and list(NAME_RE.finditer(t))
-    if not ms: return None, t
-    if ms[0].start() != 0:  # gap o'rtasida: faqat yangi qator yoki ; . ! ? dan keyingi nomlar
-        ms = [m for m in ms if re.search(r"(^|[\n;.!?])\s*$", t[:m.start()])]
-        if not ms: return None, t
-    prefix, out = t[:ms[0].start()].strip(), {}
-    for i, m in enumerate(ms):
-        seg = t[m.end(): ms[i + 1].start() if i + 1 < len(ms) else len(t)].strip()
-        task = (prefix + "\n" + seg).strip()
-        if task: out[ALIASES[m.group(1).lower()]] = (out.get(ALIASES[m.group(1).lower()], "") + "\n" + task).strip()
-    return out or None, t
+def cost(model: str, tin: int, tout: int) -> float:
+    """Taxminiy narx (USD), 1M token uchun."""
+    m = model.lower()
+    if "haiku" in m:
+        pin, pout = (0.10, 0.50) if tin <= 100_000 else (0.50, 2.50)
+    elif "sonnet" in m:
+        pin, pout = 2.0, 10.0
+    else:
+        pin, pout = 4.0, 20.0
+    return (tin * pin + tout * pout) / 1_000_000
 
 
-# ---------- RASM GENERATSIYASI (Cloudflare Workers AI, bepul Neuron limiti) ----------
-def cf_image(model, mime):
-    async def f(key, task, system, name):
-        ks = [k.strip() for k in E("CLOUDFLARE_API_KEYS", "").split(",") if k.strip()]
-        ids = [i.strip() for i in E("CF_ACCOUNT_IDS", "").split(",") if i.strip()]
-        acc = ids[ks.index(key)] if key in ks and ks.index(key) < len(ids) else ""
-        for _ in range(2):  # qora/bo'sh rasm chiqsa, boshqa seed bilan bir marta qayta uriniladi
-            body = {"prompt": task, "seed": random.randint(1, 2**31 - 1)}
-            if "flux" in model: body["steps"] = 4
-            async with httpx.AsyncClient(timeout=T) as c:
-                r = await c.post(f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/{model}",
-                                 headers={"Authorization": f"Bearer {key}"}, json=body)
-                check(r, name)
-                if "json" in r.headers.get("content-type", ""):
-                    j = r.json(); b64 = (j.get("result") or j).get("image", "")
-                else:
-                    b64 = base64.b64encode(r.content).decode()
-            if b64 and len(b64) * 3 // 4 > 6000:  # juda kichik fayl = qora/bo'sh rasm
-                return f"data:{mime};base64," + b64
-        raise RuntimeError("Model qora/bo'sh rasm qaytardi (kontent filtri bo'lishi mumkin). Boshqacha tasvirlab qayta urinib ko'ring.")
-    return f
+# ---------- baza ----------
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+lock = threading.Lock()
+db.executescript(
+    """
+create table if not exists users(id integer primary key, name text, allowed integer default 0);
+create table if not exists chats(id integer primary key autoincrement, uid integer, title text, ts real);
+create table if not exists msgs(id integer primary key autoincrement, chat_id integer, role text, content text, ts real);
+create table if not exists usage(id integer primary key autoincrement, uid integer, model text, tin integer, tout integer, usd real, ts real);
+create index if not exists i_chats_uid on chats(uid, ts);
+create index if not exists i_msgs_chat on msgs(chat_id, id);
+create index if not exists i_usage_uid on usage(uid);
+"""
+)
 
-img_pools = [Pool("FLUX", "CLOUDFLARE_API_KEYS", cf_image("@cf/black-forest-labs/flux-1-schnell", "image/jpeg")),
-             Pool("SDXL", "CLOUDFLARE_API_KEYS", cf_image(E("CF_IMAGE_MODEL2", "@cf/bytedance/stable-diffusion-xl-lightning"), "image/png"))]
-img_pools = [p for p in img_pools if p.keys and E("CF_ACCOUNT_IDS")]
 
-IMG_RE = re.compile(r"(rasm|surat|logo|illyustratsiya|tasvir|poster)\w*\s+(yasa|chiz|yarat|ishla|hosil)|\b(draw|generate an? (image|picture))\b|^\s*(rasm|img)\s*[:\-]", re.I)
-def is_image(t): return bool(IMG_RE.search(t))
+def run(sql, args=()):
+    with lock:
+        cur = db.execute(sql, args)
+        db.commit()
+        return cur.lastrowid
 
-async def to_english(task):
-    sysm = "Foydalanuvchi so'rovidan rasm generatsiya qilish uchun bitta qisqa, ravshan INGLIZCHA prompt yoz. Faqat promptning o'zini qaytar."
-    async def one(p): return (await p.call(task, sysm)).strip().strip('"')[:500]
-    ts = [asyncio.ensure_future(one(p)) for p in pools[:2]]
+
+def get(sql, args=()):
+    with lock:
+        return db.execute(sql, args).fetchall()
+
+
+def spent() -> float:
+    return get("select coalesce(sum(usd),0) from usage")[0][0]
+
+
+def stats(uid: int) -> dict:
+    """Byudjet va token hisobi: umumiy va shu foydalanuvchi uchun."""
+    mine = get("select coalesce(sum(tin),0), coalesce(sum(tout),0), coalesce(sum(usd),0) from usage where uid=?", (uid,))[0]
+    total = get("select coalesce(sum(tin),0), coalesce(sum(tout),0), coalesce(sum(usd),0) from usage")[0]
+    return {
+        "spent": total[2],
+        "budget": BUDGET,
+        "left": max(0.0, BUDGET - total[2]),
+        "my_in": mine[0],
+        "my_out": mine[1],
+        "my_usd": mine[2],
+        "all_in": total[0],
+        "all_out": total[1],
+    }
+
+
+def parse_id(s: str):
+    """Faqat oddiy 0-9 raqamlar (str.isdigit() '²' kabi belgilarni ham o'tkazib yuboradi)."""
+    return int(s) if re.fullmatch(r"[0-9]{1,15}", s) else None
+
+
+def like(s: str) -> str:
+    return "%" + s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def make_backup() -> str:
+    path = DB_PATH + ".bak"
+    with lock:
+        dst = sqlite3.connect(path)
+        db.backup(dst)
+        dst.close()
+    return path
+
+
+# ---------- Telegram ----------
+http = httpx.AsyncClient(timeout=45)
+
+
+async def tg(method: str, **params):
     try:
-        for f in asyncio.as_completed(ts, timeout=20):
-            try:
-                r = await f
-                if r: return r
-            except Exception: continue
-    except asyncio.TimeoutError: pass
-    finally:
-        for t in ts: t.cancel()
-    return task
+        r = await http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params)
+        return r.json()
+    except Exception as e:
+        log.warning("tg %s: %s", method, e)
+        return {}
 
-def stream(jobs, static):
-    """Har bir AI javobi tayyor bo'lishi bilan darhol yuboriladi (eng sekin AI boshqalarni kutdirmaydi)."""
-    async def w(n, co):
-        try: return n, await asyncio.wait_for(co, 60)
-        except asyncio.TimeoutError: return n, {"ok": False, "text": "Javob kutish vaqti tugadi (60 soniya)."}
-    async def gen():
+
+def open_button():
+    return {"inline_keyboard": [[{"text": "Claude'ni ochish", "web_app": {"url": WEBAPP_URL}}]]}
+
+
+def is_allowed(uid: int) -> bool:
+    if uid == ADMIN_ID:
+        return True
+    row = get("select allowed from users where id=?", (uid,))
+    return bool(row and row[0]["allowed"])
+
+
+async def handle_message(m: dict):
+    uid = m["from"]["id"]
+    name = m["from"].get("first_name", "")
+    text = (m.get("text") or "").strip()
+    run(
+        "insert into users(id,name,allowed) values(?,?,0) on conflict(id) do update set name=excluded.name",
+        (uid, name),
+    )
+    if uid == ADMIN_ID and text.startswith("/allow"):
+        parts = text.split()
+        target = parse_id(parts[1]) if len(parts) == 2 else None
+        if target is not None:
+            run("insert into users(id,name,allowed) values(?,?,1) on conflict(id) do update set allowed=1", (target, ""))
+            await tg("sendMessage", chat_id=uid, text=f"{target} ruxsat oldi.")
+            await tg("sendMessage", chat_id=target, text="Sizga ruxsat berildi. /start bosing.")
+        else:
+            await tg("sendMessage", chat_id=uid, text="Format: /allow 123456789")
+        return
+    if uid == ADMIN_ID and text.startswith("/deny"):
+        parts = text.split()
+        target = parse_id(parts[1]) if len(parts) == 2 else None
+        if target is not None:
+            run("update users set allowed=0 where id=?", (target,))
+            await tg("sendMessage", chat_id=uid, text=f"{target} ruxsati olib tashlandi.")
+        return
+    if uid == ADMIN_ID and text.startswith("/users"):
+        rows = get("select id,name,allowed from users order by allowed desc")
+        lines = [f"{'✅' if r['allowed'] else '⏳'} {r['id']} {r['name']}" for r in rows]
+        await tg("sendMessage", chat_id=uid, text="\n".join(lines) or "Foydalanuvchi yo'q")
+        return
+    if uid == ADMIN_ID and text.startswith("/models"):
         try:
-            for n, o in static.items(): yield json.dumps({"n": n, "r": o}, ensure_ascii=False) + "\n"
-            for fut in asyncio.as_completed([w(n, c) for n, c in jobs]):
-                n, o = await fut
-                yield json.dumps({"n": n, "r": o}, ensure_ascii=False) + "\n"
+            page = await ai.models.list(limit=100)
+            ids = [m.id for m in page.data]
+            msg = "Mavjud modellar:\n" + "\n".join(ids) if ids else "Ro'yxat bo'sh"
+            msg += "\n\nRenderda MODEL_IDS ga kerakli nomlarni vergul bilan yozing."
         except Exception as e:
-            yield json.dumps({"n": "Server", "r": {"ok": False, "text": f"Oqim xatosi: {type(e).__name__}: {e}"}}) + "\n"
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
+            msg = f"Ro'yxat olinmadi: {type(e).__name__}. Sotuvchi qo'llanmasidan model nomlarini oling."
+        await tg("sendMessage", chat_id=uid, text=msg[:4000])
+        return
+    if uid == ADMIN_ID and text.startswith("/backup"):
+        try:
+            path = await asyncio.to_thread(make_backup)
+            with open(path, "rb") as f:
+                data = f.read()
+            os.remove(path)
+            await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": str(uid), "caption": "Baza nusxasi (claude_bot.db)"},
+                files={"document": ("claude_bot.db", data)},
+                timeout=120,
+            )
+        except Exception as e:
+            log.exception("backup")
+            await tg("sendMessage", chat_id=uid, text=f"Backup xatosi: {type(e).__name__}")
+        return
+    if is_allowed(uid):
+        await tg(
+            "sendMessage",
+            chat_id=uid,
+            text=f"Salom, {name}. Claude tayyor. Ilovani ochib yozishni boshlang.",
+            reply_markup=open_button(),
+        )
+    else:
+        await tg("sendMessage", chat_id=uid, text="Ruxsat so'rovi adminga yuborildi. Tasdiqlangach xabar keladi.")
+        if ADMIN_ID:
+            await tg(
+                "sendMessage",
+                chat_id=ADMIN_ID,
+                text=f"Yangi so'rov: {name} (ID {uid})\nRuxsat berish: /allow {uid}",
+            )
 
-async def make_images(task):
-    if not img_pools:
-        return {"Rasm": {"ok": False, "text": "Rasm uchun Cloudflare kalit va CF_ACCOUNT_IDS kerak."}}
-    prompt = await to_english(task)
-    out = await asyncio.gather(*[ask(p, prompt) for p in img_pools])
-    return {p.name: o for p, o in zip(img_pools, out)}
 
-@app.post("/api/sendimg")
-async def send_img(r: Req):
-    uid, _, _ = auth(r.initData)
-    m = re.match(r"data:image/(\w+);base64,(.+)", r.text, re.S)
-    if not m: raise HTTPException(400, "Rasm topilmadi")
-    async with httpx.AsyncClient(timeout=60) as c:
-        await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", data={"chat_id": uid},
-                     files={"photo": ("rasm." + m.group(1), base64.b64decode(m.group(2)))})
+async def safe_handle(m: dict):
+    try:
+        await handle_message(m)
+    except Exception:
+        log.exception("handle_message")
+
+
+async def poll():
+    await tg("deleteWebhook")
+    if WEBAPP_URL:
+        await tg("setChatMenuButton", menu_button={"type": "web_app", "text": "Claude", "web_app": {"url": WEBAPP_URL}})
+    offset = 0
+    fails = 0
+    while True:
+        try:
+            r = await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                json={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                timeout=40,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                # masalan 409 (boshqa nusxa ishlayapti) yoki 429 - bo'sh siklda aylanib qolmaslik uchun
+                raise RuntimeError(f"getUpdates {r.status_code}: {data.get('description')}")
+            fails = 0
+            for u in data.get("result", []):
+                offset = u["update_id"] + 1  # xabar bir marta olinadi, xatoda qayta kelmaydi
+                if "message" in u and "from" in u["message"]:
+                    asyncio.create_task(safe_handle(u["message"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            fails += 1
+            log.warning("poll xato (%s): %s", fails, e)
+            await asyncio.sleep(min(3 * fails, 30))
+
+
+@asynccontextmanager
+async def lifespan(_):
+    task = asyncio.create_task(poll())
+    yield
+    task.cancel()
+    await http.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+ai = AsyncAnthropic()  # ANTHROPIC_API_KEY env'dan olinadi
+
+
+# ---------- autentifikatsiya ----------
+def auth(init: str) -> dict:
+    try:
+        d = dict(parse_qsl(init, keep_blank_values=True))
+        h = d.pop("hash")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), h):
+            raise ValueError
+        if time.time() - int(d["auth_date"]) > 7 * 86400:
+            raise ValueError
+        user = json.loads(d["user"])
+    except Exception:
+        raise HTTPException(401, "Telegram orqali oching")
+    if not is_allowed(user["id"]):
+        raise HTTPException(403, "Sizga hali ruxsat berilmagan")
+    return user
+
+
+def own_chat(uid: int, chat_id: int):
+    rows = get("select * from chats where id=? and uid=?", (chat_id, uid))
+    if not rows:
+        raise HTTPException(404, "Suhbat topilmadi")
+    return rows[0]
+
+
+# ---------- API ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML
+
+
+@app.get("/api/me")
+async def me(x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    return {"name": u.get("first_name", ""), "models": MODELS, "default": DEFAULT_MODEL, **stats(u["id"])}
+
+
+@app.get("/api/chats")
+async def chats(q: str = "", x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    sql = "select c.id,c.title,c.ts from chats c where c.uid=? and exists(select 1 from msgs m where m.chat_id=c.id)"
+    args = [u["id"]]
+    q = q.strip()[:100]
+    if q:
+        sql += " and (c.title like ? escape '\\' or exists(select 1 from msgs m where m.chat_id=c.id and m.content like ? escape '\\'))"
+        args += [like(q), like(q)]
+    rows = get(sql + " order by c.ts desc limit 300", args)
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/chats")
+async def new_chat(x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    return {"id": run("insert into chats(uid,title,ts) values(?,?,?)", (u["id"], "Yangi suhbat", time.time()))}
+
+
+@app.get("/api/chats/{chat_id}")
+async def chat_msgs(chat_id: int, x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    own_chat(u["id"], chat_id)
+    rows = get("select role,content from msgs where chat_id=? order by id", (chat_id,))
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/chats/{chat_id}")
+async def del_chat(chat_id: int, x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    own_chat(u["id"], chat_id)
+    run("delete from msgs where chat_id=?", (chat_id,))
+    run("delete from chats where id=?", (chat_id,))
     return {"ok": True}
 
-@app.post("/api/run")
-async def run(r: Req):
-    auth(r.initData)
-    if not pools: raise HTTPException(500, "Hech bir API kalit sozlanmagan")
-    per, plain = split_tasks(r.task)
-    jobs, static, imgs = [], {}, []
-    if per is None:
-        if is_image(plain): imgs = [plain]
-        else: jobs = [(p.name, ask(p, plain)) for p in pools]
-    else:
-        byname = {p.name: p for p in pools}
-        for n, t in per.items():
-            if is_image(t): imgs.append(t); continue
-            if n in byname: jobs.append((n, ask(byname[n], t)))
-            else: static[n] = {"ok": False, "text": f"{n} ulanmagan." + (" xAI bepul API bermaydi." if n == "Grok" else " .env da kalit yo'q.")}
-    if imgs:
-        if not img_pools: static["Rasm"] = {"ok": False, "text": "Rasm uchun Cloudflare kalit va CF_ACCOUNT_IDS kerak."}
+
+@app.post("/api/file")
+async def send_file(body: dict, x_init_data: str = Header("")):
+    """Kod yoki rasmni foydalanuvchining Telegram chatiga fayl qilib yuboradi."""
+    u = auth(x_init_data)
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", str(body.get("name", "kod.txt")))[:60] or "kod.txt"
+    if "." not in name:
+        name += ".txt"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    try:
+        if body.get("b64"):
+            raw = base64.b64decode(str(body["b64"]), validate=False)
+            if not raw or len(raw) > 8_000_000:
+                raise ValueError
         else:
-            pt = asyncio.ensure_future(to_english("\n".join(imgs)))
-            async def ij(p):
-                pr = await pt
-                o = await ask(p, pr); o["prompt"] = pr
-                return o
-            jobs += [(p.name, ij(p)) for p in img_pools]
-    if r.stream: return stream(jobs, static)
-    async def w(n, co):  # eski (keshdagi) frontend uchun: hammasini kutib, bitta JSON qaytaradi
-        try: return n, await asyncio.wait_for(co, 60)
-        except asyncio.TimeoutError: return n, {"ok": False, "text": "Javob kutish vaqti tugadi (60 soniya)."}
-    out = dict(static)
-    out.update(dict(await asyncio.gather(*[w(n, c) for n, c in jobs])))
-    return out
-
-@app.post("/api/compare")
-async def compare(r: Req):
-    auth(r.initData)
-    body = "\n\n".join(f"=== {n} ===\n{t}" for n, t in r.answers.items())
-    q = (f"Vazifa: {r.task}\n\nQuyidagi AI javoblarini solishtir: har birining kuchli va zaif tomonlarini qisqa yoz, "
-         f"eng yaxshisini tanla, so'ng ularning eng yaxshi jihatlarini birlashtirgan yakuniy kodni ber.\n\n{body}")
-    for p in sorted(pools, key=lambda p: len(p.ready()) == 0):
-        o = await ask(p, q)
-        if o["ok"]: return {"text": f"(Taqqoslovchi: {p.name})\n\n" + o["text"]}
-    return {"text": o["text"]}
-
-@app.post("/api/zip")
-async def zip_send(r: Req):
-    uid, _, _ = auth(r.initData)
-    files, n = {}, 0
-    for blk in re.findall(r"```[^\n]*\n(.*?)```", r.text, re.S):
-        n += 1
-        m = re.search(r"fayl:\s*([\w./\-]+)", blk.split("\n", 1)[0])
-        body = blk.split("\n", 1)[1] if m and "\n" in blk else blk
-        name = (m.group(1) if m else f"file_{n}.txt").lstrip("/").replace("..", "")
-        files[name] = body
-    if not files: raise HTTPException(400, "Zip uchun kod bloki topilmadi")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for k, v in files.items(): z.writestr(k, v)
-    async with httpx.AsyncClient() as c:
-        await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", data={"chat_id": uid},
-                     files={"document": ("loyiha.zip", buf.getvalue())})
-    return {"files": len(files)}
-
-@app.post("/api/admin")
-def admin(r: Req):
-    _, _, adm = auth(r.initData)
-    if not adm: raise HTTPException(403, "Faqat admin")
-    if r.action == "add": db.execute("insert or replace into users values(?,?)", (r.id, r.name)); db.commit()
-    if r.action == "remove": db.execute("delete from users where id=?", (r.id,)); db.commit()
-    return {"users": [{"id": i, "name": n} for i, n in db.execute("select id,name from users")],
-            "keys": [{"name": p.name, "total": len(p.keys), "ready": len(p.ready()),
-                      "reset": human(p.reset_in()) if not p.ready() else ""} for p in pools]}
+            content = str(body.get("content", ""))
+            if not content.strip() or len(content) > 500_000:
+                raise ValueError
+            raw = content.encode("utf-8")
+    except Exception:
+        raise HTTPException(400, "Fayl bo'sh yoki juda katta")
+    ok = False
+    try:
+        if name.lower().endswith(".png"):
+            r = await http.post(f"{url}/sendPhoto", data={"chat_id": str(u["id"])}, files={"photo": (name, raw)}, timeout=60)
+            ok = r.json().get("ok", False)
+        if not ok:
+            r = await http.post(f"{url}/sendDocument", data={"chat_id": str(u["id"])}, files={"document": (name, raw)}, timeout=60)
+            ok = r.json().get("ok", False)
+    except Exception as e:
+        log.warning("send_file: %s", e)
+    if not ok:
+        raise HTTPException(502, "Telegram fayl yubora olmadi. Botda /start bosing.")
+    return {"ok": True}
 
 
-HTML = '<!doctype html>\n<html lang="uz"><head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">\n<title>AI Hub</title>\n<script src="https://telegram.org/js/telegram-web-app.js"></script>\n<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;800&display=swap" rel="stylesheet">\n<style>\n:root{--ink:#0c2d52;--mut:#4f6f92;--glass:rgba(255,255,255,.45);--edge:rgba(255,255,255,.9)}\n*{box-sizing:border-box;margin:0}\nhtml,body{height:100%}\nbody{font:16px/1.5 \'Bricolage Grotesque\',system-ui,sans-serif;color:var(--ink);background:#dcefff;overflow:hidden}\n.bg{position:fixed;inset:0;z-index:-1;background:linear-gradient(180deg,#e8f5ff,#cde7fb)}\n.bg i{position:absolute;border-radius:50%;filter:blur(60px);opacity:.75}\n.bg i:nth-child(1){width:60vw;height:60vw;background:#9ccbf5;top:-15vw;left:-15vw}\n.bg i:nth-child(2){width:55vw;height:55vw;background:#c4e3ff;bottom:5vh;right:-20vw}\n.bg i:nth-child(3){width:45vw;height:45vw;background:#b2dafa;bottom:-15vw;left:5vw}\n.glass{background:var(--glass);backdrop-filter:blur(22px) saturate(180%);-webkit-backdrop-filter:blur(22px) saturate(180%);\n border:1px solid var(--edge);border-radius:26px;box-shadow:inset 0 1px 0 rgba(255,255,255,.55),inset 0 -1px 0 rgba(255,255,255,.08),0 12px 40px rgba(40,100,160,.18)}\n#app{height:100%;display:flex;flex-direction:column;gap:12px;padding:calc(env(safe-area-inset-top) + 14px) 14px calc(env(safe-area-inset-bottom) + 14px)}\nh1{font-weight:800;font-size:28px;letter-spacing:-.02em;padding:0 6px}\n.task{padding:12px;display:flex;flex-direction:column;gap:10px}\ntextarea{width:100%;min-height:92px;resize:none;border:0;outline:0;background:transparent;color:var(--ink);font:inherit}\ntextarea::placeholder{color:var(--mut)}\nbutton.go{align-self:flex-end;border:1px solid var(--edge);color:var(--ink);font:600 16px inherit;font-family:inherit;padding:10px 22px;border-radius:999px;\n background:linear-gradient(180deg,rgba(255,255,255,.35),rgba(255,255,255,.1));box-shadow:inset 0 1px 0 rgba(255,255,255,.6);cursor:pointer}\nbutton.go:disabled{opacity:.5}\n#out{flex:1;min-height:0;overflow:auto;padding:18px;display:none}\n#out.on{display:block}\n#out p{margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}\npre{position:relative;background:rgba(255,255,255,.6);border:1px solid rgba(80,140,200,.25);border-radius:16px;padding:14px;margin:0 0 14px;overflow:auto;font:13px/1.5 ui-monospace,monospace}\npre button{position:sticky;float:right;top:0;border:1px solid var(--edge);background:rgba(255,255,255,.75);color:var(--ink);border-radius:10px;padding:3px 10px;font-size:12px}\n.err{color:#c0392b;overflow-wrap:anywhere}\n.load{display:flex;gap:6px;justify-content:center;padding:40px}\n.load b{width:10px;height:10px;border-radius:50%;background:#4a90d9;animation:p 1s infinite}\n.load b:nth-child(2){animation-delay:.15s}.load b:nth-child(3){animation-delay:.3s}\n@keyframes p{50%{transform:translateY(-8px);opacity:.4}}\n#tabs{display:none;gap:4px;padding:6px;overflow-x:auto;position:relative}\n#tabs.on{display:flex}\n#tabs button{flex:1 0 auto;border:0;background:transparent;color:var(--mut);font:600 15px inherit;font-family:inherit;padding:11px 16px;border-radius:999px;position:relative;z-index:1;transition:color .2s}\n#tabs button.act{color:var(--ink)}\n#tabs button.act::before{content:"";position:absolute;inset:0;z-index:-1;border-radius:999px;background:linear-gradient(180deg,rgba(255,255,255,.4),rgba(255,255,255,.12));\n border:1px solid var(--edge);box-shadow:inset 0 1px 0 rgba(255,255,255,.7)}\n#tabs button.bad::after{content:"";width:6px;height:6px;border-radius:50%;background:#ff7b7b;display:inline-block;margin-left:6px}\n@media(prefers-reduced-motion:reduce){*{animation:none!important}}\n\n.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}\n.acts button,.adm button{border:1px solid var(--edge);background:rgba(255,255,255,.65);color:var(--ink);font:600 14px inherit;font-family:inherit;padding:8px 16px;border-radius:999px}\n.top{display:flex;justify-content:space-between;align-items:center}\n#gear{display:none}\n#adm{position:fixed;inset:0;z-index:5;display:none;padding:calc(env(safe-area-inset-top) + 14px) 14px 14px}\n#adm.on{display:block}\n.adm{height:100%;overflow:auto;padding:18px}\n.adm h2{font-size:20px;margin:14px 0 8px}\n.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid rgba(60,120,190,.2)}\n.adm input{background:rgba(255,255,255,.65);border:1px solid var(--edge);border-radius:12px;color:var(--ink);padding:9px 12px;font:inherit;width:100%;margin-bottom:8px}\n</style></head><body>\n<div class="bg"><i></i><i></i><i></i></div>\n<div id="app">\n <div class="top"><h1>AI Hub</h1><div style="display:flex;gap:8px"><button class="go" id="hbtn" style="padding:8px 16px">Tarix</button><button class="go" id="gear" style="padding:8px 16px">Admin</button></div></div>\n <div class="glass task">\n  <textarea id="t" placeholder="Vazifa yozing. Bitta AI uchun: gemini bot kodi yoz. Alohida: gemini kod yoz groq tushuntirma yoz. Rasm uchun: tabiat rasmi yasa. Nom yozilmasa hammasi ishlaydi"></textarea>\n  <button class="go" id="go">Yuborish</button>\n </div>\n <div class="glass" id="out"></div>\n <div class="glass" id="tabs"></div>\n<div id="adm"><div class="glass adm" id="admc"></div></div>\n</div>\n<script>\nconst tg=window.Telegram?.WebApp; tg?.ready(); tg?.expand();\nconst $=id=>document.getElementById(id);\nconst esc=s=>String(s).replace(/[&<>]/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\'}[c]));\nlet res={},cur=null,task0=\'\';\nasync function api(p,b={}){const r=await fetch(p,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({...b,initData:tg?.initData||\'\'})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);return j}\nfunction render(txt){return txt.split(/```/).map((p,i)=>{\n if(i%2){const nl=p.indexOf(\'\\n\');return `<pre><button onclick="cp(this)">Nusxa</button><code>${esc(p.slice(nl+1))}</code></pre>`}\n return p.trim()?`<p>${esc(p.trim())}</p>`:\'\'}).join(\'\')}\nfunction cp(b){navigator.clipboard.writeText(b.nextElementSibling.textContent);b.textContent=\'Nusxalandi\';setTimeout(()=>b.textContent=\'Nusxa\',1200)}\nfunction tabs(){$(\'tabs\').innerHTML=Object.keys(res).map(n=>`<button data-n="${n}" class="${res[n].ok?\'\':\'bad\'}">${n}</button>`).join(\'\');\n [...$(\'tabs\').children].forEach(b=>{b.onclick=()=>show(b.dataset.n);b.classList.toggle(\'act\',b.dataset.n===cur)});$(\'tabs\').classList.add(\'on\')}\nfunction show(n){cur=n;const r=res[n];\n const isImg=r.ok&&r.text.startsWith(\'data:image\');\n $(\'out\').innerHTML=isImg?`<img src="${r.text}" style="width:100%;border-radius:18px;display:block">${r.prompt?`<p style="font-size:13px;color:var(--mut);margin-top:8px">Prompt: ${esc(r.prompt)}</p>`:\'\'}<div class="acts"><button onclick="sendImg()">Botga yuborish</button></div>`:(r.ok?render(r.text):`<p class="err">${esc(r.text)}</p>`)+(r.ok?`<div class="acts"><button onclick="zip()">Zip yuborish</button>${n!==\'Taqqoslash\'?\'<button onclick="cmp()">Solishtirish</button>\':\'\'}</div>`:\'\');\n $(\'out\').scrollTop=0;[...$(\'tabs\').children].forEach(b=>b.classList.toggle(\'act\',b.dataset.n===n))}\nasync function zip(){try{const j=await api(\'/api/zip\',{text:res[cur].text});tg?.showAlert(`${j.files} ta fayl zip qilib botga yuborildi`)}catch(e){tg?.showAlert(e.message)}}\nasync function cmp(){$(\'out\').innerHTML=\'<div class="load"><b></b><b></b><b></b></div>\';\n const a={};for(const n in res)if(res[n].ok&&n!==\'Taqqoslash\'&&!res[n].text.startsWith(\'data:image\'))a[n]=res[n].text;\n try{const j=await api(\'/api/compare\',{task:task0,answers:a});res.Taqqoslash={ok:true,text:j.text}}catch(e){res.Taqqoslash={ok:false,text:e.message}}\n tabs();show(\'Taqqoslash\')}\n\nasync function sendImg(){try{await api(\'/api/sendimg\',{text:res[cur].text});tg?.showAlert(\'Rasm botga yuborildi\')}catch(e){tg?.showAlert(e.message)}}\nconst store={\n get(cb){const p=v=>{try{const a=JSON.parse(v||\'[]\');return Array.isArray(a)?a:[]}catch{return[]}};\n  if(tg?.CloudStorage)tg.CloudStorage.getItem(\'hist\',(e,v)=>cb(p(v)));else{let v;try{v=localStorage.getItem(\'hist\')}catch{}cb(p(v))}},\n set(a){let s=JSON.stringify(a);while(s.length>3800&&a.length){a.pop();s=JSON.stringify(a)}\n  if(tg?.CloudStorage)tg.CloudStorage.setItem(\'hist\',s);else try{localStorage.setItem(\'hist\',s)}catch{}}};\nfunction addHist(t){store.get(h=>{h=h.filter(x=>x.t!==t.slice(0,160));h.unshift({t:t.slice(0,160),ts:Date.now()});store.set(h.slice(0,25))})}\nfunction clearHist(){store.set([]);hist()}\nfunction hist(){store.get(h=>{\n $(\'admc\').innerHTML=`<div class="top"><h2>Tarix</h2><button onclick="$(\'adm\').classList.remove(\'on\')">Yopish</button></div>`+\n (h.length?h.map((x,i)=>`<div class="row" data-i="${i}" style="cursor:pointer"><span>${esc(x.t)}</span><small style="color:var(--mut);white-space:nowrap">${new Date(x.ts).toLocaleDateString()}</small></div>`).join(\'\')+`<div class="acts" style="margin-top:14px"><button onclick="clearHist()">Tarixni tozalash</button></div>`:`<p>Hali bo\'sh</p>`);\n [...$(\'admc\').querySelectorAll(\'.row\')].forEach(r=>r.onclick=()=>{$(\'t\').value=h[+r.dataset.i].t;$(\'adm\').classList.remove(\'on\')});\n $(\'adm\').classList.add(\'on\')})}\n$(\'hbtn\').onclick=hist;\n$(\'go\').onclick=async()=>{const t=$(\'t\').value.trim();if(!t)return;task0=t;addHist(t);\n $(\'go\').disabled=true;$(\'tabs\').classList.remove(\'on\');$(\'out\').classList.add(\'on\');$(\'out\').innerHTML=\'<div class="load"><b></b><b></b><b></b></div>\';\n try{res={};cur=null;let shown=false;\n  const r=await fetch(\'/api/run\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({task:t,stream:true,initData:tg?.initData||\'\'})});\n  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.detail||r.status)}\n  const ct=r.headers.get(\'content-type\')||\'\';\n  if(ct.includes(\'application/json\')){res=await r.json();tabs();const k0=Object.keys(res).find(n=>res[n].ok)||Object.keys(res)[0];if(k0)show(k0);$(\'go\').disabled=false;return}\n  const rd=r.body.getReader(),dec=new TextDecoder();let buf=\'\',raw=\'\';\n  while(true){const{done,value}=await rd.read();if(done)break;const ch=dec.decode(value,{stream:true});buf+=ch;if(raw.length<300)raw+=ch;\n   let i;while((i=buf.indexOf(\'\\n\'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;\n    const m=JSON.parse(line);res[m.n]=m.r;tabs();if(!shown&&m.r.ok){shown=true;show(m.n)}}}\n  if(buf.trim()){try{const m=JSON.parse(buf.trim());if(m&&m.n&&m.r)res[m.n]=m.r;else Object.assign(res,m);tabs()}catch{}}\n  if(!shown){const k=Object.keys(res).find(n=>res[n].ok)||Object.keys(res)[0];if(k)show(k);else $(\'out\').innerHTML=`<p class="err">Javob kelmadi (HTTP ${r.status}, ${esc(ct)}). Server javobi: ${esc(raw.slice(0,200)||\'bo\\u2018sh\')}</p>`}}catch(e){$(\'out\').innerHTML=`<p class="err">${esc(e.message)}</p>`}\n $(\'go\').disabled=false};\nasync function adm(a={action:\'list\'}){const j=await api(\'/api/admin\',a);\n $(\'admc\').innerHTML=`<div class="top"><h2>Admin panel</h2><button onclick="$(\'adm\').classList.remove(\'on\')">Yopish</button></div>\n <h2>Foydalanuvchilar</h2>${j.users.map(u=>`<div class="row"><span>${esc(u.name)} · ${u.id}</span><button onclick="adm({action:\'remove\',id:${u.id}})">O\'chirish</button></div>`).join(\'\')||\'<p>Hali yo\\\'q</p>\'}\n <h2>Qo\'shish</h2><input id="uid" inputmode="numeric" placeholder="Telegram ID"><input id="un" placeholder="Ism"><button onclick="adm({action:\'add\',id:+uid.value,name:un.value})">Qo\'shish</button>\n <h2>API kalitlar holati</h2>${j.keys.map(k=>`<div class="row"><b>${k.name}</b><span>${k.ready}/${k.total} tayyor${k.reset?` · tiklanish: ${k.reset}`:\'\'}</span></div>`).join(\'\')}`;\n $(\'adm\').classList.add(\'on\')}\n$(\'gear\').onclick=()=>adm();\napi(\'/api/me\').then(j=>{if(j.admin)$(\'gear\').style.display=\'block\'}).catch(e=>{$(\'out\').classList.add(\'on\');$(\'out\').innerHTML=`<p class="err">${esc(e.message)}</p>`;$(\'go\').disabled=true});\n</script></body></html>\n'
+@app.post("/api/send")
+async def send(body: dict, x_init_data: str = Header("")):
+    u = auth(x_init_data)
+    try:
+        chat_id = int(body.get("chat_id", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Noto'g'ri suhbat")
+    chat = own_chat(u["id"], chat_id)
+    text = str(body.get("text", "")).strip()[:20000]
+    model = body.get("model") if body.get("model") in MODELS else DEFAULT_MODEL
+    if not text:
+        raise HTTPException(400, "Bo'sh xabar")
+    if spent() >= BUDGET:
+        raise HTTPException(402, "Byudjet tugadi. BUDGET_USD ni oshiring yoki hisobni to'ldiring.")
+
+    run("insert into msgs(chat_id,role,content,ts) values(?,?,?,?)", (chat["id"], "user", text, time.time()))
+    if chat["title"] == "Yangi suhbat":
+        run("update chats set title=?, ts=? where id=?", (text[:40], time.time(), chat["id"]))
+    else:
+        run("update chats set ts=? where id=?", (time.time(), chat["id"]))
+    rows = get("select role,content from msgs where chat_id=? order by id desc limit 30", (chat["id"],))
+    history = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    while history and history[0]["role"] != "user":  # 30 ta limit tufayli assistant bilan boshlanib qolmasin
+        history.pop(0)
+
+    async def gen():
+        acc, tin, tout, stream = [], 0, 0, None
+        try:
+            async with ai.messages.stream(model=model, max_tokens=4096, system=SYSTEM, messages=history) as s:
+                stream = s
+                async for t in s.text_stream:
+                    acc.append(t)
+                    yield t
+                final = await s.get_final_message()
+            tin, tout = final.usage.input_tokens, final.usage.output_tokens
+        except Exception as e:
+            log.warning("anthropic xato: %s", e)
+            yield f"\n\n⚠️ Xato: {type(e).__name__}. API kalit va balansni tekshiring."
+        finally:
+            # Foydalanuvchi "to'xtatish" bossa ham (yoki ulanish uzilsa) javob va sarf saqlanadi
+            if not (tin or tout) and stream is not None:
+                try:
+                    snap = stream.current_message_snapshot.usage
+                    tin, tout = snap.input_tokens or 0, snap.output_tokens or 0
+                except Exception:
+                    pass
+            if not (tin or tout) and acc:  # taxminiy hisob
+                tin = sum(len(m["content"]) for m in history) // 3
+                tout = len("".join(acc)) // 3
+            if acc:
+                run("insert into msgs(chat_id,role,content,ts) values(?,?,?,?)", (chat["id"], "assistant", "".join(acc), time.time()))
+            usd = cost(model, tin, tout)
+            if tin or tout:
+                run("insert into usage(uid,model,tin,tout,usd,ts) values(?,?,?,?,?,?)", (u["id"], model, tin, tout, usd, time.time()))
+        yield "\x00" + json.dumps({"usd": usd, "tin": tin, "tout": tout, **stats(u["id"])})
+
+    return StreamingResponse(gen(), media_type="text/plain; charset=utf-8", headers={"X-Accel-Buffering": "no"})
+
+
+# ---------- Frontend ----------
+HTML = r"""<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Claude</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#FAF9F5;--panel:#F3F1E9;--text:#141413;--mute:#73726C;--line:#E6E4DA;--accent:#D97757;--accent-d:#C6613F;--user:#EFEDE4;--code:#F0EEE6;--serif:"Tiempos Text",Georgia,"Times New Roman",serif;--sans:-apple-system,"Segoe UI",Roboto,system-ui,sans-serif}
+[data-theme=dark]{--bg:#262624;--panel:#1F1E1D;--text:#F0EEE6;--mute:#A3A198;--line:#3B3A37;--accent:#D97757;--accent-d:#E58A6B;--user:#323230;--code:#1F1E1D}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);display:flex;flex-direction:column;height:100dvh;overflow:hidden}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;padding-top:max(10px,env(safe-area-inset-top));border-bottom:1px solid transparent}
+.ib{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;color:var(--mute)}
+.ib:active{background:var(--panel)}
+.pill{display:flex;align-items:center;gap:6px;padding:8px 12px;border-radius:12px;font-family:var(--serif);font-size:17px}
+.pill:active{background:var(--panel)}
+.pill svg{color:var(--mute)}
+#scroll{flex:1;overflow-y:auto;padding:8px 16px 16px;scroll-behavior:smooth}
+.col{max-width:720px;margin:0 auto}
+#empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:14px;padding-bottom:8vh}
+#empty h1{font-family:var(--serif);font-weight:400;font-size:34px;margin:0;letter-spacing:-.01em}
+#empty p{margin:0;color:var(--mute);font-size:15px}
+.msg{margin:18px 0}
+.msg.user{display:flex;justify-content:flex-end}
+.msg.user .b{background:var(--user);padding:10px 14px;border-radius:18px;max-width:86%;white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:16px}
+.msg.assistant{display:flex;gap:10px;align-items:flex-start}
+.msg.assistant .av{flex:0 0 22px;margin-top:4px}
+.msg.assistant .b{flex:1;min-width:0;font-family:var(--serif);font-size:17px;line-height:1.65;word-break:break-word}
+.b p{margin:0 0 .85em}.b p:last-child{margin-bottom:0}
+.b h2,.b h3,.b h4,.b h5{font-family:var(--serif);font-weight:600;margin:1.1em 0 .4em;line-height:1.3}
+.b h2{font-size:1.3em}.b h3{font-size:1.15em}.b h4,.b h5{font-size:1em}
+.b ul,.b ol{margin:0 0 .85em;padding-left:1.4em}.b li{margin:.25em 0}
+.b a{color:var(--accent-d)}
+.b code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.86em;background:var(--code);padding:.15em .4em;border-radius:6px}
+.b pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:12px 14px;overflow-x:auto;margin:0 0 .85em}
+.b pre code{background:none;padding:0;font-size:.82em;line-height:1.55}
+.cb{margin:0 0 .85em}.cb pre{margin:0}
+.ch{display:flex;justify-content:space-between;align-items:center;gap:8px;font:12px var(--sans);color:var(--mute);padding:4px 2px}
+.fbtn{font:13px var(--sans);color:var(--accent-d);padding:5px 10px;border-radius:8px;border:1px solid var(--line)}
+.fbtn:active{background:var(--panel)}.fbtn:disabled{opacity:.6}
+.svgimg{display:block;max-width:100%;height:auto;border-radius:12px;background:#fff;border:1px solid var(--line);margin-bottom:4px}
+.acts{display:flex;gap:4px;margin-top:6px}
+.acts button{font-family:var(--sans);font-size:13px;color:var(--mute);padding:4px 8px;border-radius:8px}
+.acts button:active{background:var(--panel)}
+.spin{animation:sp 1.6s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}#scroll{scroll-behavior:auto}}
+footer{padding:8px 12px;padding-bottom:max(12px,env(safe-area-inset-bottom))}
+.box{max-width:720px;margin:0 auto;background:var(--bg);border:1px solid var(--line);border-radius:24px;padding:8px 8px 8px 16px;display:flex;align-items:flex-end;gap:8px;box-shadow:0 2px 14px rgba(20,20,19,.06)}
+[data-theme=dark] .box{background:var(--user)}
+textarea{flex:1;border:0;background:none;color:var(--text);font:16px/1.5 var(--sans);resize:none;max-height:160px;padding:8px 0;outline:none}
+textarea::placeholder{color:var(--mute)}
+#go{width:38px;height:38px;border-radius:12px;background:var(--accent);color:#fff;display:grid;place-items:center;flex:0 0 auto}
+#go:active{background:var(--accent-d)}
+#go:disabled{opacity:.4}
+.hint{max-width:720px;margin:6px auto 0;text-align:center;font-size:12px;color:var(--mute)}
+#veil{position:fixed;inset:0;background:rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .2s}
+#veil.on{opacity:1;pointer-events:auto}
+#drawer{position:fixed;top:0;bottom:0;left:0;width:min(84vw,320px);background:var(--panel);transform:translateX(-100%);transition:transform .22s ease;display:flex;flex-direction:column;padding-top:env(safe-area-inset-top)}
+#drawer.on{transform:none}
+.dh{padding:14px 16px 8px;font-family:var(--serif);font-size:22px;display:flex;align-items:center;gap:8px}
+#newc{margin:6px 12px;padding:10px 12px;border-radius:12px;color:var(--accent-d);text-align:left;display:flex;gap:8px;align-items:center;font-weight:500}
+#newc:active{background:var(--line)}
+#list{flex:1;overflow-y:auto;padding:4px 8px}
+.sr{padding:4px 12px 8px}
+.sr input{width:100%;border:1px solid var(--line);background:var(--bg);color:var(--text);border-radius:10px;padding:9px 12px;font:15px var(--sans);outline:none}
+.sr input:focus-visible{border-color:var(--accent)}
+.grp{padding:12px 10px 4px;font-size:12px;color:var(--mute);letter-spacing:.02em}
+.none{padding:14px 10px;font-size:14px;color:var(--mute)}
+.tk{font-size:12px;color:var(--mute);padding:4px 8px;align-self:center}
+#uk,#ua{margin-top:4px;line-height:1.45}
+.ci{display:flex;align-items:center;border-radius:10px}
+.ci.cur{background:var(--line)}
+.ci button.t{flex:1;text-align:left;padding:10px 10px;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ci button.x{padding:8px 10px;color:var(--mute);font-size:18px}
+.us{padding:14px 16px;padding-bottom:max(14px,env(safe-area-inset-bottom));border-top:1px solid var(--line);font-size:13px;color:var(--mute)}
+.bar{height:6px;background:var(--line);border-radius:3px;margin:8px 0 6px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);width:0}
+#sheet{position:fixed;left:50%;top:calc(56px + env(safe-area-inset-top));transform:translateX(-50%);width:min(92vw,360px);background:var(--bg);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px rgba(20,20,19,.15);padding:6px;display:none}
+#sheet.on{display:block}
+#sheet button{display:block;width:100%;text-align:left;padding:10px 12px;border-radius:10px}
+#sheet button:active,#sheet button.cur{background:var(--panel)}
+#sheet b{font-family:var(--serif);font-weight:500;font-size:16px;display:block}
+#sheet span{font-size:13px;color:var(--mute)}
+</style>
+</head>
+<body>
+<header>
+  <button class="ib" id="menu" aria-label="Suhbatlar"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg></button>
+  <button class="pill" id="mp"><span id="mn">Haiku 5.5</span><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+  <button class="ib" id="nw" aria-label="Yangi suhbat"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg></button>
+</header>
+<div id="sheet"></div>
+<div id="scroll"><div class="col" id="msgs"></div></div>
+<footer>
+  <div class="box">
+    <textarea id="inp" rows="1" placeholder="Claude'ga yozing"></textarea>
+    <button id="go" aria-label="Yuborish"></button>
+  </div>
+  <div class="hint">Claude xato qilishi mumkin. Muhim ma'lumotlarni tekshiring.</div>
+</footer>
+<div id="veil"></div>
+<aside id="drawer">
+  <div class="dh" id="dh"></div>
+  <button id="newc"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Yangi suhbat</button>
+  <div class="sr"><input id="q" type="search" placeholder="Tarixdan qidirish" autocomplete="off"></div>
+  <div id="list"></div>
+  <div class="us"><div id="ut"></div><div class="bar"><i id="ub"></i></div><div id="uk"></div><div id="ua"></div><div id="ud"></div></div>
+</aside>
+<script>
+const tg=window.Telegram&&Telegram.WebApp; if(tg){tg.ready();tg.expand()}
+const initData=tg?tg.initData:'';
+const theme=(tg&&tg.colorScheme)||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+document.documentElement.dataset.theme=theme;
+const $=id=>document.getElementById(id);
+let me=null,chatId=null,model='claude-haiku-5-5',busy=false,ctrl=null;
+try{model=localStorage.getItem('model')||model}catch(e){}
+
+function spark(size,cls){let l='';for(let i=0;i<12;i++){const long=i%2===0;const a=i*30*Math.PI/180,r1=13,r2=long?44:33;l+=`<line x1="${(Math.cos(a)*r1).toFixed(1)}" y1="${(Math.sin(a)*r1).toFixed(1)}" x2="${(Math.cos(a)*r2).toFixed(1)}" y2="${(Math.sin(a)*r2).toFixed(1)}"/>`}
+return `<svg class="${cls||''}" width="${size}" height="${size}" viewBox="-50 -50 100 100" stroke="#D97757" stroke-width="8" stroke-linecap="round">${l}</svg>`}
+const SEND='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
+const STOP='<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="3"/></svg>';
+
+async function api(path,opt={}){
+  const r=await fetch(path,{...opt,headers:{'X-Init-Data':initData,'Content-Type':'application/json',...(opt.headers||{})}});
+  if(!r.ok){let d='';try{d=(await r.json()).detail}catch(e){}throw new Error(d||r.status)}
+  return r.json();
+}
+const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const fmt=n=>Number(n||0).toLocaleString('en-US');
+function inl(t){const codes=[];
+  t=t.replace(/`([^`]+)`/g,(m,c)=>{codes.push(c);return '\u0002'+(codes.length-1)+'\u0002'});
+  t=t.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return t.replace(/\u0002(\d+)\u0002/g,(m,i)=>'<code>'+codes[i]+'</code>')}
+function md(s){
+  const blocks=[];
+  s=s.replace(/```([\w+#.-]*)\n?([\s\S]*?)(```|$)/g,(m,l,c,end)=>{
+    c=c.replace(/\n$/,'');l=(l||'').toLowerCase();const done=end==='```';let h;
+    if(done&&(l==='svg'||(l==='xml'&&/^\s*<svg/i.test(c)))&&/<\/svg>\s*$/i.test(c)){
+      h='<div class="cb"><img class="svgimg" alt="rasm" src="'+svgUri(c)+'"><div class="ch"><span></span><span><button class="fbtn" data-k="svg">SVG fayl</button> <button class="fbtn" data-k="png">PNG rasm</button></span></div><pre hidden><code>'+esc(c)+'</code></pre></div>'}
+    else{
+      h='<div class="cb"><div class="ch"><span>'+esc(l||'kod')+'</span>'+(done?'<button class="fbtn" data-k="file" data-l="'+esc(l)+'">Fayl qilib yuborish</button>':'')+'</div><pre><code>'+esc(c)+'</code></pre></div>'}
+    blocks.push(h);return '\n\u0001'+(blocks.length-1)+'\u0001\n'});
+  s=esc(s);
+  let out='',list=null,para=[];
+  const fp=()=>{if(para.length){out+='<p>'+inl(para.join('<br>'))+'</p>';para=[]}};
+  const fl=()=>{if(list){out+='</'+list+'>';list=null}};
+  for(const ln of s.split('\n')){let m;
+    if(m=ln.match(/^(#{1,4})\s+(.*)/)){fp();fl();const n=m[1].length+1;out+='<h'+n+'>'+inl(m[2])+'</h'+n+'>'}
+    else if(m=ln.match(/^\s*[-*]\s+(.*)/)){fp();if(list!=='ul'){fl();out+='<ul>';list='ul'}out+='<li>'+inl(m[1])+'</li>'}
+    else if(m=ln.match(/^\s*\d+[.)]\s+(.*)/)){fp();if(list!=='ol'){fl();out+='<ol>';list='ol'}out+='<li>'+inl(m[1])+'</li>'}
+    else if(!ln.trim()){fp();fl()}
+    else if(/^\u0001\d+\u0001$/.test(ln.trim())){fp();fl();out+=ln.trim()}
+    else{fl();para.push(ln)}}
+  fp();fl();
+  return out.replace(/\u0001(\d+)\u0001/g,(m,i)=>blocks[i])}
+
+function fixSvg(s){
+  s=s.trim();const m=s.match(/<svg\b[^>]*>/i);if(!m)return s;
+  let nt=m[0];
+  if(!/xmlns=/.test(nt))nt=nt.replace(/<svg/i,'<svg xmlns="http://www.w3.org/2000/svg"');
+  const vb=nt.match(/viewBox=["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i);
+  if(vb&&!/\swidth=/i.test(nt))nt=nt.replace(/<svg/i,'<svg width="'+vb[1]+'" height="'+vb[2]+'"');
+  return s.replace(m[0],nt)}
+const svgUri=s=>'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(fixSvg(s));
+function svgToPng(svg){return new Promise((res,rej)=>{const im=new Image();
+  im.onload=()=>{const w=im.naturalWidth||800,h=im.naturalHeight||800,k=Math.min(2,2000/Math.max(w,h));
+    const c=document.createElement('canvas');c.width=Math.round(w*k);c.height=Math.round(h*k);
+    const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,0,0,c.width,c.height);
+    try{res(c.toDataURL('image/png').split(',')[1])}catch(e){rej(e)}};
+  im.onerror=()=>rej(new Error('Rasm tayyorlanmadi'));im.src=svgUri(svg)})}
+const EXT={python:'py',py:'py',javascript:'js',js:'js',typescript:'ts',ts:'ts',html:'html',css:'css',json:'json',java:'java',c:'c',cpp:'cpp','c++':'cpp',csharp:'cs','c#':'cs',cs:'cs',go:'go',rust:'rs',php:'php',ruby:'rb',bash:'sh',sh:'sh',shell:'sh',sql:'sql',markdown:'md',md:'md',xml:'xml',yaml:'yaml',yml:'yml',kotlin:'kt',swift:'swift',dart:'dart',lua:'lua',r:'r'};
+$('msgs').addEventListener('click',async e=>{
+  const b=e.target.closest('.fbtn');if(!b||b.disabled)return;
+  const code=b.closest('.cb').querySelector('code').textContent,k=b.dataset.k,old=b.textContent;
+  b.disabled=true;b.textContent='Yuborilmoqda...';
+  try{
+    let body;
+    if(k==='png')body={name:'rasm.png',b64:await svgToPng(code)};
+    else if(k==='svg')body={name:'rasm.svg',content:code};
+    else body={name:'kod.'+(EXT[b.dataset.l]||'txt'),content:code};
+    await api('/api/file',{method:'POST',body:JSON.stringify(body)});
+    b.textContent='Botga yuborildi \u2713';
+  }catch(x){b.textContent='Xato: '+(x.message||'')}
+  setTimeout(()=>{b.textContent=old;b.disabled=false},2500)});
+
+function showEmpty(){
+  $('msgs').innerHTML=`<div id="empty">${spark(48)}<h1>Salom, ${esc(me?me.name:'')}</h1><p>Bugun nimada yordam beray?</p></div>`}
+function addMsg(role,text,live){
+  if($('empty'))$('msgs').innerHTML='';
+  const d=document.createElement('div');d.className='msg '+role;
+  if(role==='user'){d.innerHTML='<div class="b"></div>';d.firstChild.textContent=text;$('msgs').appendChild(d);scrollDown();return {}}
+  d.innerHTML=`<div class="av">${spark(22,live?'spin':'')}</div><div class="b"></div>`;
+  const body=d.querySelector('.b');body.innerHTML=md(text);$('msgs').appendChild(d);scrollDown();
+  return {d,body,av:d.querySelector('.av')}}
+function acts(el,text,info){
+  const a=document.createElement('div');a.className='acts';
+  a.innerHTML='<button>Nusxalash</button>';
+  a.firstChild.onclick=async e=>{try{await navigator.clipboard.writeText(text);e.target.textContent='Nusxalandi';setTimeout(()=>e.target.textContent='Nusxalash',1500)}catch(x){}};
+  if(info&&(info.tin||info.tout)){const t=document.createElement('span');t.className='tk';t.textContent=fmt(info.tin+info.tout)+' token · $'+info.usd.toFixed(4);a.appendChild(t)}
+  el.body.appendChild(a)}
+function scrollDown(){const s=$('scroll');s.scrollTop=s.scrollHeight}
+
+function setBtn(){$('go').innerHTML=busy?STOP:SEND}
+function fit(){const t=$('inp');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,160)+'px'}
+function usage(u){
+  const p=Math.min(100,u.spent/u.budget*100);
+  $('ub').style.width=p+'%';$('ut').textContent='Sarflandi: $'+u.spent.toFixed(2)+' / $'+u.budget.toFixed(0)+' · qoldi $'+u.left.toFixed(2);
+  $('uk').textContent='Sizning tokenlaringiz: '+fmt(u.my_in+u.my_out)+' (kirish '+fmt(u.my_in)+', chiqish '+fmt(u.my_out)+')';
+  $('ua').textContent='Umumiy tokenlar: '+fmt(u.all_in+u.all_out);
+  $('ud').textContent='Taxminiy hisob. Aniq balans Anthropic Console\'da.'}
+
+async function send(){
+  if(busy){ctrl&&ctrl.abort();return}
+  const text=$('inp').value.trim();if(!text)return;
+  try{if(!chatId){chatId=(await api('/api/chats',{method:'POST'})).id}}catch(e){addMsg('assistant','⚠️ '+e.message);return}
+  $('inp').value='';fit();addMsg('user',text);
+  const el=addMsg('assistant','',true);
+  busy=true;setBtn();ctrl=new AbortController();let acc='',info=null;
+  const paint=()=>{el.body.innerHTML=md(acc);scrollDown()};
+  try{
+    const res=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json','X-Init-Data':initData},body:JSON.stringify({chat_id:chatId,text,model}),signal:ctrl.signal});
+    if(!res.ok){let d=res.status;try{d=(await res.json()).detail}catch(e){}acc='⚠️ '+d;paint()}
+    else{
+      const rd=res.body.getReader(),dec=new TextDecoder();let buf='',raf=0;
+      while(true){const {done,value}=await rd.read();if(done)break;
+        buf+=dec.decode(value,{stream:true});const i=buf.indexOf('\u0000');
+        acc=i<0?buf:buf.slice(0,i);
+        if(!raf)raf=requestAnimationFrame(()=>{raf=0;paint()});
+        if(i>=0){try{info=JSON.parse(buf.slice(i+1));usage(info)}catch(e){}}}
+      paint()}
+  }catch(e){if(e.name!=='AbortError'){acc+='\n\n⚠️ Ulanish uzildi';paint()}}
+  el.av.innerHTML=spark(22);
+  if(acc&&!acc.startsWith('⚠️'))acts(el,acc,info);
+  busy=false;setBtn();loadChats()}
+
+function grpName(ts){
+  const day=x=>new Date(x.getFullYear(),x.getMonth(),x.getDate()).getTime();
+  const diff=Math.round((day(new Date())-day(new Date(ts*1000)))/864e5);
+  return diff<=0?'Bugun':diff===1?'Kecha':diff<=7?'Oxirgi 7 kun':diff<=30?'Oxirgi 30 kun':'Avvalroq'}
+let qv='';
+async function loadChats(){
+  try{const rows=await api('/api/chats?q='+encodeURIComponent(qv));
+  const L=$('list');L.innerHTML='';
+  if(!rows.length){const e=document.createElement('div');e.className='none';e.textContent=qv?'Hech narsa topilmadi':'Tarix hozircha bo\'sh';L.appendChild(e)}
+  let g='';
+  for(const c of rows){
+    const n=grpName(c.ts);if(n!==g){g=n;const h=document.createElement('div');h.className='grp';h.textContent=n;L.appendChild(h)}
+    const d=document.createElement('div');d.className='ci'+(c.id===chatId?' cur':'');
+    d.innerHTML='<button class="t"></button><button class="x" aria-label="O\'chirish">×</button>';
+    d.querySelector('.t').textContent=c.title;
+    d.querySelector('.t').onclick=()=>{openChat(c.id);drawer(false)};
+    d.querySelector('.x').onclick=async()=>{if(!confirm('Suhbat o\'chirilsinmi?'))return;await api('/api/chats/'+c.id,{method:'DELETE'});if(c.id===chatId)newChat();loadChats()};
+    L.appendChild(d)}}catch(e){}}
+async function openChat(id){
+  chatId=id;$('msgs').innerHTML='';
+  const rows=await api('/api/chats/'+id);
+  if(!rows.length)showEmpty();
+  for(const m of rows){const el=addMsg(m.role,m.content);if(m.role==='assistant')acts(el,m.content)}
+  scrollDown();loadChats()}
+function newChat(){chatId=null;showEmpty();loadChats()}
+function drawer(on){$('drawer').classList.toggle('on',on);$('veil').classList.toggle('on',on)}
+
+function buildSheet(){
+  const s=$('sheet');s.innerHTML='';
+  for(const [id,m] of Object.entries(me.models)){
+    const b=document.createElement('button');if(id===model)b.className='cur';
+    b.innerHTML='<b></b><span></span>';b.querySelector('b').textContent=m.name;b.querySelector('span').textContent=m.desc;
+    b.onclick=()=>{model=id;try{localStorage.setItem('model',id)}catch(e){}$('mn').textContent=m.name;s.classList.remove('on');buildSheet()};
+    s.appendChild(b)}
+  $('mn').textContent=(me.models[model]||me.models[me.default]).name}
+
+let qt=0;$('q').addEventListener('input',e=>{clearTimeout(qt);qt=setTimeout(()=>{qv=e.target.value.trim();loadChats()},250)});
+$('go').onclick=send;
+$('inp').addEventListener('input',fit);
+$('inp').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!matchMedia('(pointer:coarse)').matches){e.preventDefault();send()}});
+$('menu').onclick=()=>drawer(true);$('veil').onclick=()=>{drawer(false);$('sheet').classList.remove('on')};
+$('nw').onclick=newChat;$('newc').onclick=()=>{newChat();drawer(false)};
+$('mp').onclick=()=>{$('sheet').classList.toggle('on')};
+$('dh').innerHTML=spark(26)+'<span>Claude</span>';
+setBtn();
+(async()=>{
+  try{me=await api('/api/me');if(!me.models[model])model=me.default;buildSheet();usage(me);showEmpty();loadChats()}
+  catch(e){$('msgs').innerHTML='<div id="empty">'+spark(48)+'<h1>Kirish yopiq</h1><p>'+esc(e.message)+'</p></div>'}
+})();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
